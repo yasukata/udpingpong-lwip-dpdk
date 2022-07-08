@@ -55,10 +55,8 @@
 #include <lwip/pbuf.h>
 #include <lwip/netif.h>
 #include <lwip/etharp.h>
-#include <lwip/tcpip.h>
-#include <lwip/tcp.h>
+#include <lwip/udp.h>
 #include <lwip/timeouts.h>
-#include <lwip/prot/tcp.h>
 
 #include <netif/ethernet.h>
 
@@ -73,8 +71,10 @@ static struct rte_mempool *pktmbuf_pool = NULL;
 static int tx_idx = 0;
 static struct rte_mbuf *tx_mbufs[MAX_PKT_BURST] = { 0 };
 
-static char *httpbuf;
-static size_t httpdatalen;
+#define MAX_QUEUE_DEPTH (4096)
+static bool is_client = false;
+static unsigned long counter[MAX_QUEUE_DEPTH] = { 0 };
+static int init_state = 0;
 
 static void tx_flush(void)
 {
@@ -109,41 +109,21 @@ static err_t low_level_output(struct netif *netif __attribute__((unused)), struc
 	return ERR_OK;
 }
 
-static err_t tcp_recv_handler(void *arg __attribute__((unused)), struct tcp_pcb *tpcb,
-			      struct pbuf *p, err_t err)
+static void udp_recv_handler(void *arg __attribute__((unused)),
+			     struct udp_pcb *upcb,
+			     struct pbuf *p, const ip_addr_t *addr,
+			     u16_t port)
 {
-	char buf[4] = { 0 };
-	if (err != ERR_OK)
-		return err;
-	if (!p) {
-		tcp_close(tpcb);
-		return ERR_OK;
-	}
-	pbuf_copy_partial(p, buf, 3, 0);
-	if (!strncmp(buf, "GET", 3)) {
-		assert(tcp_sndbuf(tpcb) >= httpdatalen);
-		assert(tcp_write(tpcb, httpbuf, httpdatalen, TCP_WRITE_FLAG_COPY) == ERR_OK);
-		assert(tcp_output(tpcb) == ERR_OK);
-	}
-	tcp_recved(tpcb, p->tot_len);
+	int i;
+	assert(p->len >= sizeof(int));
+	i = *((int *) p->payload); // lazy access
+	assert(i <= MAX_QUEUE_DEPTH);
+	if (i < MAX_QUEUE_DEPTH) {
+		counter[i]++;
+		assert(udp_sendto(upcb, p, addr, port) == ERR_OK);
+	} else
+		init_state = 1;
 	pbuf_free(p);
-	return ERR_OK;
-}
-
-static err_t accept_handler(void *arg __attribute__((unused)), struct tcp_pcb *tpcb, err_t err)
-{
-	if (err != ERR_OK)
-		return err;
-
-	tcp_recv(tpcb, tcp_recv_handler);
-	tcp_setprio(tpcb, TCP_PRIO_MAX);
-
-	tpcb->so_options |= SOF_KEEPALIVE;
-	tpcb->keep_intvl = (60 * 1000);
-	tpcb->keep_idle = (60 * 1000);
-	tpcb->keep_cnt = 1;
-
-	return err;
 }
 
 static uint8_t _mac[6];
@@ -164,8 +144,9 @@ static err_t if_init(struct netif *netif)
 int main(int argc, char* const* argv)
 {
 	struct netif _netif = { 0 };
-	ip4_addr_t _addr, _mask, _gate;
-	size_t content_len = 1;
+	ip4_addr_t _addr, _mask, _gate, _remote_addr;
+	size_t additional_payload_len = 0;
+	int queue_depth = 1;
 	int server_port = 10000;
 
 	/* setting up dpdk */
@@ -223,7 +204,7 @@ int main(int argc, char* const* argv)
 	{
 		int ch;
 		bool _a = false, _g = false, _m = false;
-		while ((ch = getopt(argc, argv, "a:g:l:m:p:")) != -1) {
+		while ((ch = getopt(argc, argv, "a:g:l:m:p:q:s:")) != -1) {
 			switch (ch) {
 			case 'a':
 				inet_pton(AF_INET, optarg, &_addr);
@@ -238,10 +219,18 @@ int main(int argc, char* const* argv)
 				_m = true;
 				break;
 			case 'l':
-				content_len = atol(optarg);
+				additional_payload_len = atol(optarg);
 				break;
 			case 'p':
 				server_port = atoi(optarg);
+				break;
+			case 'q':
+				queue_depth = atoi(optarg);
+				assert(queue_depth < MAX_QUEUE_DEPTH);
+				break;
+			case 's':
+				inet_pton(AF_INET, optarg, &_remote_addr);
+				is_client = true;
 				break;
 			default:
 				assert(0);
@@ -254,6 +243,7 @@ int main(int argc, char* const* argv)
 	/* setting up lwip */
 	{
 		lwip_init();
+		udp_init();
 		assert(netif_add(&_netif, &_addr, &_mask, &_gate, NULL, if_init, ethernet_input) != NULL);
 		netif_set_default(&_netif);
 		netif_set_link_up(&_netif);
@@ -262,26 +252,26 @@ int main(int argc, char* const* argv)
 
 	/* main procedure */
 	{
-		struct tcp_pcb *tpcb, *_tpcb;
-		{
-			size_t buflen = content_len + 256 /* for http hdr */;
-			char *content;
-			assert((httpbuf = (char *) malloc(buflen)) != NULL);
-			assert((content = (char *) malloc(content_len + 1)) != NULL);
-			memset(content, 'A', content_len);
-			content[content_len] = '\0';
-			httpdatalen = snprintf(httpbuf, buflen, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\nConnection: keep-alive\r\n\r\n%s",
-					content_len, content);
-			free(content);
-			printf("http data length: %lu bytes\n", httpdatalen);
-		}
+		struct timespec _t;
+		struct udp_pcb *upcb;
+			sys_check_timeouts();
+		assert((upcb = udp_new()) != NULL);
+		udp_recv(upcb, udp_recv_handler, NULL);
+		if (is_client) {
+			struct pbuf *p;
+			assert((p = pbuf_alloc(PBUF_TRANSPORT, sizeof(int) + additional_payload_len, PBUF_RAM)) != NULL);
+			*((int *) p->payload) = MAX_QUEUE_DEPTH;
+			assert(udp_sendto(upcb, p, &_remote_addr, server_port) == ERR_OK);
+			pbuf_free(p);
+		} else
+			assert(udp_bind(upcb, IP_ADDR_ANY, server_port) == ERR_OK);
 
-		assert((_tpcb = tcp_new()) != NULL);
-		assert(tcp_bind(_tpcb, IP_ADDR_ANY, server_port) == ERR_OK);
-		assert((tpcb = tcp_listen(_tpcb)) != NULL);
-		tcp_accept(tpcb, accept_handler);
+		printf("-- pid %d : application (%s) has started --\n",
+				getpid(),
+				is_client ? "client" : "server");
 
-		printf("-- application has started --\n");
+		assert(!clock_gettime(CLOCK_REALTIME, &_t));
+
 		/* primary loop */
 		while (1) {
 			struct rte_mbuf *rx_mbufs[MAX_PKT_BURST];
@@ -298,6 +288,38 @@ int main(int argc, char* const* argv)
 			}
 			tx_flush();
 			sys_check_timeouts();
+			if (is_client) {
+				if (init_state == 1) {
+					int j;
+					printf("transmit %d packets (payload len %lu + sizeof(int) %lu)\n", queue_depth, additional_payload_len, sizeof(int));
+					for (j = 0; j < queue_depth; j++) {
+						struct pbuf *p;
+						assert((p = pbuf_alloc(PBUF_TRANSPORT, sizeof(int) + additional_payload_len, PBUF_RAM)) != NULL);
+						*((int *) p->payload) = j;
+						memset((void *)((uintptr_t) p->payload + sizeof(int)), 'A', additional_payload_len);
+						p->len = sizeof(int) + additional_payload_len;
+						assert(udp_sendto(upcb, p, &_remote_addr, server_port) == ERR_OK);
+						pbuf_free(p);
+					}
+					init_state = 2;
+				}
+				{
+					struct timespec __t;
+					assert(!clock_gettime(CLOCK_REALTIME, &__t));
+					if ((_t.tv_sec * 1000000000UL + _t.tv_nsec) + 1000000000UL
+							< (__t.tv_sec * 1000000000UL + __t.tv_nsec)) {
+						int j;
+						unsigned long total = 0;
+						for (j = 0; j < queue_depth; j++) {
+							printf("[%d]: %lu\n", j, counter[j]);
+							total += counter[j];
+						}
+						printf("total: %lu\n\n", total);
+						memset(counter, 0, sizeof(counter[0]) * queue_depth);
+						_t = __t;
+					}
+				}
+			}
 		}
 	}
 
