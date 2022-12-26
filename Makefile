@@ -5,7 +5,7 @@ PKGCONF = pkg-config
 
 CLEANFILES = $(PROGS) *.o *.d
 
-DPDK_VER=22.03
+DPDK_VER=22.11.1
 LWIP_VER=2.1.3
 CONTRIB_VER=2.1.0
 
@@ -100,7 +100,8 @@ $(LWIP_SRC_DIR).zip:
 	wget -P $(LWIP_DIR) http://download.savannah.nongnu.org/releases/lwip/lwip-$(LWIP_VER).zip
 
 $(DPDK_SRC_DIR): $(DPDK_SRC_DIR).tar.xz
-	tar xvf $< -C $(DPDK_DIR)
+	mkdir $(DPDK_DIR)/dpdk-$(DPDK_VER)
+	tar xvf $< -C $(DPDK_DIR)/dpdk-$(DPDK_VER) --strip-components 1
 
 $(CONTRIB_SRC_DIR): $(CONTRIB_SRC_DIR).zip
 	unzip -n $< -d $(LWIP_DIR)
