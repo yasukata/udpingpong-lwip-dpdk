@@ -60,8 +60,8 @@
 
 #include <netif/ethernet.h>
 
-#define MAX_PKT_BURST (32)
-#define NUM_SLOT (256)
+#define MAX_PKT_BURST (128)
+#define NUM_SLOT (1024)
 
 #define MEMPOOL_CACHE_SIZE (256)
 
@@ -118,11 +118,14 @@ static void udp_recv_handler(void *arg __attribute__((unused)),
 	assert(p->len >= sizeof(int));
 	i = *((int *) p->payload); // lazy access
 	assert(i <= MAX_QUEUE_DEPTH);
-	if (i < MAX_QUEUE_DEPTH) {
-		counter[i]++;
-		assert(udp_sendto(upcb, p, addr, port) == ERR_OK);
+	if (is_client) {
+		if (i < MAX_QUEUE_DEPTH) {
+			counter[i]++;
+			assert(udp_sendto(upcb, p, addr, port) == ERR_OK);
+		} else
+			init_state = 1;
 	} else
-		init_state = 1;
+		assert(udp_sendto(upcb, p, addr, port) == ERR_OK);
 	pbuf_free(p);
 }
 
